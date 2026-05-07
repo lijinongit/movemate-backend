@@ -1,0 +1,27 @@
+# Dockerfile for running tests consistently in CI
+# Usage: docker build -f Dockerfile.test -t movemate:test . && docker run movemate:test
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy monorepo structure
+COPY package.json package-lock.json ./
+COPY tsconfig.base.json ./
+
+# Copy all source directories
+COPY shared ./shared
+COPY services ./services
+COPY prisma ./prisma
+
+# Install all dependencies (including dev for testing)
+RUN npm ci --audit=false
+
+# Generate Prisma client
+RUN npx prisma generate
+
+# Build all packages
+RUN npm run build
+
+# Default: run all tests with coverage
+CMD ["npm", "test", "--", "--coverage", "--watchAll=false"]

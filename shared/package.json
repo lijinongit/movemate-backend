@@ -1,0 +1,31 @@
+{
+  "name": "@movemate/shared",
+  "version": "1.0.0",
+  "description": "Movemate shared utilities, middleware, and types",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src --ext .ts",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.8.0",
+    "@fastify/jwt": "^7.8.0",
+    "zod": "^3.22.4",
+    "pino": "^8.17.2",
+    "pino-http": "^8.6.1",
+    "bcryptjs": "^2.4.3",
+    "argon2": "^0.31.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/bcryptjs": "^2.4.6",
+    "typescript": "^5.3.3",
+    "fastify": "^4.25.0"
+  },
+  "peerDependencies": {
+    "fastify": "^4.25.0"
+  }
+}

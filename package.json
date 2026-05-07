@@ -1,0 +1,26 @@
+{
+  "name": "movemate-backend",
+  "version": "1.0.0",
+  "description": "Movemate backend API - Node 20 LTS with TypeScript, Fastify, Prisma",
+  "private": true,
+  "workspaces": [
+    "services/*",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "npm --workspaces run dev",
+    "build": "npm --workspaces run build",
+    "start": "npm --workspaces run start",
+    "lint": "npm --workspaces run lint",
+    "test": "npm --workspaces run test",
+    "type-check": "npm --workspaces run type-check",
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:seed": "tsx prisma/seed.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

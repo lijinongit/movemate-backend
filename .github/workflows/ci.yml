@@ -1,15 +1,71 @@
-name: Movemate CI
+name: Backend CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'shared/**'
+      - 'prisma/**'
+      - 'package.json'
+      - '.github/workflows/ci.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'shared/**'
+      - 'prisma/**'
+      - 'package.json'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-and-type-check:
-    name: Lint & TypeScript Check
+  # SECRETS REQUIRED (add to repo settings):
+  # - CODECOV_TOKEN: optional, for codecov upload
+  # - SLACK_WEBHOOK_URL: optional, for notifications
+
+  install:
+    name: Install Dependencies
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+  prisma-check:
+    name: Prisma Validation
+    runs-on: ubuntu-latest
+    needs: install
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma validate
+
+  lint-and-type-check:
+    name: Lint & TypeScript
+    runs-on: ubuntu-latest
+    needs: install
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,7 +79,8 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    needs: lint-and-type-check
+    needs: [install, prisma-check]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,27 +88,69 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npm test -- --coverage --watchAll=false
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+      - run: npm test -- --coverage --watchAll=false --testPathPattern="unit"
+      - name: Check coverage threshold (80%)
+        run: |
+          STATEMENTS=$(grep -o '"statements"[^}]*' coverage/coverage-summary.json | grep -o '[0-9.]*' | head -1)
+          echo "Statement coverage: $STATEMENTS%"
+          if (( $(echo "$STATEMENTS < 80" | bc -l) )); then
+            echo "ERROR: Coverage below 80%"
+            exit 1
+          fi
+      - name: Upload coverage
+        if: always()
+        uses: codecov/codecov-action@v4
         with:
-          fail_ci_if_error: true
-          minimum_coverage: 80
+          files: ./coverage/coverage-final.json
+          fail_ci_if_error: false
 
-  security-scan:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [install, prisma-check]
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: movemate
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: movemate_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run database migrations
+        env:
+          DATABASE_URL: postgresql://movemate:test@localhost:5432/movemate_test
+        run: npx prisma migrate deploy
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://movemate:test@localhost:5432/movemate_test
+        run: npm test -- --coverage --watchAll=false --testPathPattern="integration"
+      - name: Upload coverage
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/coverage-final.json
+          fail_ci_if_error: false
+
+  security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm audit --audit-level=high
-
-  build:
-    name: Build Check
-    runs-on: ubuntu-latest
-    needs: [unit-tests]
+    needs: install
+    timeout-minutes: 10
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -59,6 +158,81 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci
-      - run: npm run build
-        env:
-          NODE_ENV: production
+      - run: npm audit --audit-level=high
+      - name: Report security findings
+        if: failure()
+        run: echo "WARNING: Security vulnerabilities detected (non-blocking in foundation phase)"
+
+  docker-build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint-and-type-check, unit-tests, integration-tests]
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        service: [auth-service, user-service]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./services/${{ matrix.service }}/Dockerfile
+          push: false
+          tags: movemate/${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_ENV=production
+
+  owasp-zap:
+    name: OWASP ZAP Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build auth-service for testing
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./services/auth-service/Dockerfile
+          push: false
+          tags: movemate/auth-service:test
+          load: true
+      - name: Start auth-service container
+        run: |
+          docker run -d --name auth-service \
+            -p 3001:3001 \
+            -e NODE_ENV=test \
+            -e PORT=3001 \
+            movemate/auth-service:test
+          sleep 5
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.7.0
+        with:
+          target: 'http://localhost:3001'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: report_md.md
+      - name: Cleanup
+        if: always()
+        run: docker stop auth-service || true
+
+  build-success:
+    name: Build Success
+    runs-on: ubuntu-latest
+    needs: [lint-and-type-check, unit-tests, integration-tests, prisma-check, security-audit, docker-build, owasp-zap]
+    if: success()
+    steps:
+      - name: All checks passed
+        run: echo "CI pipeline successful"

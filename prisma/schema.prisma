@@ -1,0 +1,411 @@
+// Prisma Schema for Movemate Foundation (Sprint 1–2)
+// Database: PostgreSQL 15 on AWS Aurora Serverless v2
+// Region: me-south-1 (Bahrain) — PDPL compliance
+// Generated: 2026-05-03
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ============================================================================
+// USER & IDENTITY MANAGEMENT
+// ============================================================================
+
+model User {
+  id              String    @id @default(uuid())
+
+  // Contact info (PII)
+  email           String?   @unique
+  phoneHash       String?   @unique @map("phone_hash")
+  phone           String?   // Encrypted AES-256 in application layer
+
+  // Personal info (PII)
+  firstName       String    @map("first_name")
+  lastName        String    @map("last_name")
+  dob             DateTime? // Encrypted; used only for age verification
+
+  // Account status
+  role            String    // 'customer', 'trainer', 'studio_admin', 'platform_admin'
+  status          String    @default("pending_email_verification") // pending_email_verification, verified, suspended, deleted
+
+  // Multi-language support
+  locale          String    @default("en") // 'en' or 'ar'
+
+  // Authentication
+  passwordHash    String?   @map("password_hash")
+
+  // For under-18 users: link to parent/guardian
+  parentGuardianId String?  @map("parent_guardian_id")
+  parentGuardian  User?     @relation("ParentChild", fields: [parentGuardianId], references: [id], onDelete: SetNull)
+  children        User[]    @relation("ParentChild")
+
+  // Under-18 flag
+  underEighteen   Boolean   @default(false) @map("under_18")
+
+  // Soft delete
+  deletedAt       DateTime? @map("deleted_at")
+
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  customer        Customer?
+  trainer         Trainer?
+  documents       Document[]
+  parentalConsents ParentalConsent[] @relation("ParentConsent")
+  childConsents   ParentalConsent[] @relation("ChildConsent")
+  auditLogs       AuditLog[]
+  approvedBy      TrainerApplication[] @relation("ApprovedBy")
+  references      Reference[]
+
+  @@index([email])
+  @@index([phoneHash])
+  @@index([role])
+  @@index([status])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model Customer {
+  id                String   @id @default(uuid())
+  userId            String   @unique @map("user_id")
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Preferences
+  activityPreferences String? // JSON array: ["gym", "dance", "swimming"]
+  bio               String?
+
+  // Subscription (for future use; visible for Phase 2)
+  subscriptionStatus String? @map("subscription_status") // 'none', 'fixed', 'flexible', 'auto_renewing'
+
+  deletedAt         DateTime? @map("deleted_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([deletedAt])
+}
+
+model Trainer {
+  id                      String   @id @default(uuid())
+  userId                  String   @unique @map("user_id")
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Credentials & verification
+  status                  String   @default("pending_review") // pending_review, approved, suspended, rejected
+  dscLicenseNo            String?  @map("dsc_license_no") // Encrypted AES-256
+  disciplines             String?  // JSON array: ["Personal Training", "Dance", "Swimming"]
+
+  // Rate & info
+  hourlyRateAed           Int?     @map("hourly_rate_aed") // 50-500 AED
+  bio                     String?  // Trainer intro text
+  introVideoUrl           String?  @map("intro_video_url") // S3 path
+
+  // Studio affiliation (optional)
+  studioAffiliationId     String?  @map("studio_affiliation_id")
+  studio                  Studio?  @relation("TrainerStudio", fields: [studioAffiliationId], references: [id], onDelete: SetNull)
+
+  // Ratings (denormalized for performance)
+  ratingAvg               Float?   @default(0) @map("rating_avg")
+  totalSessions           Int      @default(0) @map("total_sessions")
+
+  // Founding Trainer badge
+  foundingTrainerBadge    Boolean  @default(false) @map("founding_trainer_badge")
+
+  deletedAt               DateTime? @map("deleted_at")
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  documents               Document[]
+  applications            TrainerApplication[]
+  references              Reference[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([studioAffiliationId])
+  @@index([deletedAt])
+  @@unique([userId, status]) // Optimize trainer discovery (approved trainers)
+}
+
+model Studio {
+  id                      String   @id @default(uuid())
+
+  // Business info
+  name                    String
+  address                 String
+  lat                     Float    // Latitude
+  lng                     Float    // Longitude
+  phone                   String
+  email                   String
+
+  // Facilities (JSON: ["Gym", "Studio Rooms", "Lounge", "Outdoor"])
+  facilities              String?
+
+  // Contract
+  contractSignedAt        DateTime? @map("contract_signed_at")
+  revenueSharePct         Int      @default(30) @map("revenue_share_pct") // 20-50%
+
+  // Status
+  status                  String   @default("contract_pending") // contract_pending, active, inactive
+
+  // Soft delete
+  deletedAt               DateTime? @map("deleted_at")
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  trainers                Trainer[] @relation("TrainerStudio")
+
+  @@index([status])
+  @@index([contractSignedAt])
+  @@index([deletedAt])
+}
+
+// ============================================================================
+// DOCUMENTS & PII STORAGE
+// ============================================================================
+
+model Document {
+  id                      String   @id @default(uuid())
+  userId                  String   @map("user_id")
+  user                    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Document metadata
+  documentType            String   @map("document_type")
+  // Valid types: emirates_id, dsc_cert_personal_training, dsc_cert_dance, dsc_cert_swimming,
+  // dsc_cert_football, dsc_cert_cricket, dsc_cert_yoga, intro_video, profile_photo
+
+  s3Path                  String   @map("s3_path") // Encrypted path stored in DB
+  fileSizeBytes           Int      @map("file_size_bytes")
+
+  // Verification
+  status                  String   @default("pending_verification") // pending_verification, verified, rejected, expired
+  verifiedBy              String?  @map("verified_by") // Admin user ID
+  verifiedAt              DateTime? @map("verified_at")
+  rejectionReason         String?  @map("rejection_reason")
+
+  // Expiry (for ID and certs)
+  expiryDate              DateTime? @map("expiry_date")
+
+  // Soft delete (PDPL right-to-erasure)
+  deletedAt               DateTime? @map("deleted_at")
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([documentType])
+  @@index([status])
+  @@index([expiryDate])
+  @@index([deletedAt])
+  @@unique([userId, documentType]) // One active Emirates ID, one active DSC cert per type, etc.
+}
+
+// ============================================================================
+// PARENTAL CONSENT & UNDER-18 PROTECTION
+// ============================================================================
+
+model ParentalConsent {
+  id                      String   @id @default(uuid())
+  childId                 String   @map("child_id")
+  child                   User     @relation("ChildConsent", fields: [childId], references: [id], onDelete: Cascade)
+
+  parentId                String?  @map("parent_id")
+  parent                  User?    @relation("ParentConsent", fields: [parentId], references: [id], onDelete: SetNull)
+
+  // Consent details
+  consentGiven            Boolean  @default(false) @map("consent_given")
+  consentTimestamp        DateTime? @map("consent_timestamp")
+  termsAccepted           Boolean  @default(false) @map("terms_accepted")
+
+  // Soft delete
+  deletedAt               DateTime? @map("deleted_at")
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  @@index([childId])
+  @@index([parentId])
+  @@index([consentGiven])
+  @@unique([childId]) // One parent consent per child
+}
+
+// ============================================================================
+// TRAINER APPLICATION & APPROVAL WORKFLOW
+// ============================================================================
+
+model TrainerApplication {
+  id                      String   @id @default(uuid())
+  trainerId               String   @map("trainer_id")
+  trainer                 Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+
+  // Application state
+  status                  String   @default("pending_review") // pending_review, approved, rejected, pending_resubmission
+  submittedAt             DateTime @default(now()) @map("submitted_at")
+
+  // Approval/Rejection
+  reviewedBy              String?  @map("reviewed_by") // Admin user ID
+  reviewedAt              DateTime? @map("reviewed_at")
+  decisionNotes           String?  @map("decision_notes")
+  rejectionReason         String?  @map("rejection_reason")
+  // Valid reasons: invalid_dsc_cert, unresponsive_reference, credential_conflict, other
+
+  // Badge
+  foundingTrainerBadge    Boolean  @default(false) @map("founding_trainer_badge")
+
+  // Soft delete
+  deletedAt               DateTime? @map("deleted_at")
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  reviewer                User?    @relation("ApprovedBy", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  references              Reference[]
+
+  @@index([trainerId])
+  @@index([status])
+  @@index([submittedAt])
+  @@index([deletedAt])
+}
+
+// ============================================================================
+// REFERENCE CONTACTS (BACKGROUND CHECK)
+// ============================================================================
+
+model Reference {
+  id                      String   @id @default(uuid())
+  trainerId               String   @map("trainer_id")
+  trainer                 Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+
+  applicationId           String   @map("application_id")
+  application             TrainerApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  userId                  String?  @map("user_id") // If reference is a Movemate user
+  user                    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Contact details
+  name                    String
+  email                   String
+  relationship            String   // gym_manager, current_client, previous_client, coach, studio_owner, other
+
+  // Contact tracking
+  contactAttemptedAt      DateTime? @map("contact_attempted_at")
+  contactResponseAt       DateTime? @map("contact_response_at")
+  feedback                String?  // Unstructured feedback
+  status                  String   @default("pending_contact") // pending_contact, contacted, unresponsive
+
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  @@index([trainerId])
+  @@index([applicationId])
+  @@index([status])
+  @@index([contactAttemptedAt])
+}
+
+// ============================================================================
+// AUDIT LOG (IMMUTABLE EVENT STREAM)
+// ============================================================================
+
+model AuditLog {
+  id                      String   @id @default(uuid())
+
+  // Action tracking
+  action                  String   // user_registration, otp_verification, emirates_id_upload, trainer_approved, document_downloaded, account_deleted, etc.
+  userId                  String?  @map("user_id") // User performing action
+  user                    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  adminId                 String?  @map("admin_id") // Admin performing action (if applicable)
+
+  // Resource tracking
+  resourceId              String?  @map("resource_id") // Document, trainer, application ID, etc.
+  resourceType            String?  @map("resource_type") // user, document, trainer_application, etc.
+
+  // Details (no PII; only hashes/IDs)
+  details                 String?  // JSON object with action-specific metadata
+
+  // Request context
+  ipAddress               String?  @map("ip_address")
+  userAgent               String?  @map("user_agent")
+
+  // Immutable timestamp
+  createdAt               DateTime  @default(now()) @map("created_at")
+
+  // Indexes for queries (no updates/deletes allowed)
+  @@index([userId])
+  @@index([adminId])
+  @@index([action])
+  @@index([resourceType, resourceId])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// OTP & SESSION STORAGE (Short-lived)
+// ============================================================================
+
+model OtpRequest {
+  id                      String   @id @default(uuid())
+
+  userId                  String?  @map("user_id") // Nullable for pre-registration OTP
+
+  // Contact method
+  email                   String?
+  phone                   String?  // Encrypted AES-256
+
+  // OTP code & metadata
+  code                    String   // Hashed (never store plaintext)
+  attempts                Int      @default(0)
+
+  // Expiry
+  expiresAt               DateTime @map("expires_at") // 10 minutes from creation
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([email])
+  @@index([expiresAt]) // Cleanup expired OTPs
+}
+
+// ============================================================================
+// SESSION MANAGEMENT (For JWT refresh tokens)
+// ============================================================================
+
+model Session {
+  id                      String   @id @default(uuid())
+  userId                  String   @map("user_id")
+
+  // Refresh token (hashed)
+  refreshTokenHash        String   @unique @map("refresh_token_hash")
+
+  // Expiry
+  expiresAt               DateTime @map("expires_at") // 30 days from creation
+
+  // Device fingerprint (for token rotation detection)
+  deviceId                String?  @map("device_id")
+  ipAddress               String?  @map("ip_address")
+
+  // Revocation (if user logs out)
+  revokedAt               DateTime? @map("revoked_at")
+
+  // Timestamps
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}

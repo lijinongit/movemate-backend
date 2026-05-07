@@ -1,0 +1,8 @@
+# OWASP ZAP Rules Configuration
+# This file specifies rules for the ZAP security baseline scan
+# See: https://www.zaproxy.org/
+# Rules format: rule_id	severity	description
+
+# Example rules (adjust based on your application needs)
+# 10035	MEDIUM	Strict-Transport-Security Header Not Set
+# 10038	MEDIUM	Content Security Policy Header Not Set

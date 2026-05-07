@@ -1,47 +1,208 @@
-name: Deploy to Staging
+name: Backend Deploy to Staging
 
 on:
   push:
-    branches: [develop]
+    branches: [main]
+    paths:
+      - 'services/**'
+      - 'shared/**'
+      - 'prisma/**'
+      - 'package.json'
 
 jobs:
-  deploy-staging:
-    name: Deploy to AWS Staging
+  # SECRETS REQUIRED (add to repo settings):
+  # - AWS_ROLE_ARN: arn:aws:iam::ACCOUNT_ID:role/github-oidc-movemate-backend
+  # - SLACK_WEBHOOK_URL: optional
+
+  deploy:
+    name: Deploy Services to Staging
     runs-on: ubuntu-latest
     environment: staging
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        service: [auth-service, user-service]
+      max-parallel: 2
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: me-south-1
+          session-name: github-actions-movemate
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
+      - name: Build and push ${{ matrix.service }}
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          SERVICE: ${{ matrix.service }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/movemate-app:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/movemate-app:$IMAGE_TAG
+          docker build \
+            -t $ECR_REGISTRY/movemate/$SERVICE:$IMAGE_TAG \
+            -t $ECR_REGISTRY/movemate/$SERVICE:latest \
+            -f ./services/$SERVICE/Dockerfile \
+            --build-arg NODE_ENV=staging \
+            .
+          docker push $ECR_REGISTRY/movemate/$SERVICE:$IMAGE_TAG
+          docker push $ECR_REGISTRY/movemate/$SERVICE:latest
+          echo "ECR_IMAGE=$ECR_REGISTRY/movemate/$SERVICE:$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Deploy to ECS Fargate Staging
+      - name: Run Prisma migrations on staging DB
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+        run: |
+          npm ci
+          npx prisma migrate deploy --skip-generate
+
+      - name: Update ECS task definition
+        id: task-def
+        env:
+          SERVICE: ${{ matrix.service }}
+          IMAGE: ${{ env.ECR_IMAGE }}
+          CLUSTER: movemate-staging
+          AWS_REGION: me-south-1
+        run: |
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition movemate-$SERVICE-staging:1 \
+            --region $AWS_REGION | jq '.taskDefinition')
+
+          NEW_TASK_DEF=$(echo "$TASK_DEFINITION" | jq \
+            --arg IMAGE "$IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          REGISTERED=$(aws ecs register-task-definition \
+            --cli-input-json "$(echo "$NEW_TASK_DEF" | jq -c .)" \
+            --region $AWS_REGION)
+
+          TASK_DEF_ARN=$(echo "$REGISTERED" | jq -r '.taskDefinition.taskDefinitionArn')
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS Fargate (blue/green)
+        env:
+          SERVICE: ${{ matrix.service }}
+          CLUSTER: movemate-staging
+          TASK_DEF: ${{ steps.task-def.outputs.TASK_DEF_ARN }}
         run: |
           aws ecs update-service \
-            --cluster movemate-staging \
-            --service movemate-app-staging \
-            --force-new-deployment \
+            --cluster $CLUSTER \
+            --service movemate-$SERVICE-staging \
+            --task-definition $TASK_DEF \
             --region me-south-1
 
-      - name: Wait for deployment to stabilise
+      - name: Wait for service stability (max 15 mins)
+        env:
+          SERVICE: ${{ matrix.service }}
+          CLUSTER: movemate-staging
         run: |
           aws ecs wait services-stable \
-            --cluster movemate-staging \
-            --services movemate-app-staging \
-            --region me-south-1
+            --cluster $CLUSTER \
+            --services movemate-$SERVICE-staging \
+            --region me-south-1 || \
+          { echo "DEPLOYMENT_TIMEOUT=true" >> $GITHUB_ENV; exit 1; }
+
+      - name: Health check on ALB endpoint
+        env:
+          SERVICE: ${{ matrix.service }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          # Get ALB DNS for staging
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName, 'movemate-staging')].DNSName" \
+            --region me-south-1 \
+            --output text)
+
+          if [ -z "$ALB_DNS" ]; then
+            echo "Warning: ALB not found for health check"
+            exit 0
+          fi
+
+          SERVICE_PORT=3001
+          case $SERVICE in
+            user-service) SERVICE_PORT=3002 ;;
+          esac
+
+          for i in {1..12}; do
+            if curl -f -s "http://$ALB_DNS:$SERVICE_PORT/healthz" > /dev/null; then
+              echo "$SERVICE is healthy"
+              exit 0
+            fi
+            echo "Attempt $i/12: Waiting for $SERVICE health check..."
+            sleep 30
+          done
+
+          echo "ERROR: Health check failed after 6 minutes"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && env.DEPLOYMENT_TIMEOUT == 'true'
+        env:
+          SERVICE: ${{ matrix.service }}
+          CLUSTER: movemate-staging
+        run: |
+          # Retrieve previous task definition (kept for 30 days)
+          PREVIOUS_TASK=$(aws ecs describe-services \
+            --cluster $CLUSTER \
+            --services movemate-$SERVICE-staging \
+            --region me-south-1 | jq -r '.services[0].deployments[1].taskDefinition // .services[0].taskDefinition')
+
+          if [ -n "$PREVIOUS_TASK" ]; then
+            aws ecs update-service \
+              --cluster $CLUSTER \
+              --service movemate-$SERVICE-staging \
+              --task-definition $PREVIOUS_TASK \
+              --region me-south-1
+            echo "ROLLED BACK to $PREVIOUS_TASK"
+          fi
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Backend ${{ matrix.service }} deployed to staging",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ *${{ matrix.service }}* deployed to *staging*\nCommit: ${{ github.sha }}\nBranch: ${{ github.ref }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "Backend ${{ matrix.service }} deployment to staging FAILED",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *${{ matrix.service }}* deployment *FAILED*\nCommit: ${{ github.sha }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
